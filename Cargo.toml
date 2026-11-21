@@ -1,0 +1,16 @@
+[workspace]
+members = ["core", "cli", "gui"]
+default-members = ["core", "cli"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+pakcipher-core = { path = "core" }
+zeroize = "1.8"
+
+[profile.release]
+strip = "symbols"
+lto = "thin"

@@ -1,0 +1,19 @@
+[package]
+name = "pakcipher-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+aes-gcm = { version = "0.10", features = ["zeroize"] }
+hkdf = "0.12"
+hmac = "0.12"
+pgp = "0.21"
+rand = "0.8"
+rsa = "0.9"
+sha2 = "0.10"
+thiserror = "2"
+walkdir = "2"
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

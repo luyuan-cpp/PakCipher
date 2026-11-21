@@ -23,18 +23,30 @@ pub struct VolumeSize {
     max: u64,
 }
 
+impl VolumeSize {
+    pub fn from_mib_bounds(min: Option<u64>, max: Option<u64>) -> Result<Option<Self>> {
+        if min.is_none() && max.is_none() {
+            return Ok(None);
+        }
+        let min = min.unwrap_or(1);
+        let max = max.unwrap_or_else(|| min.saturating_mul(2).min(u64::MAX / MIB));
+        if min == 0 || max < min {
+            return Err(Error::VolumeSize);
+        }
+        Ok(Some(Self {
+            min: min.checked_mul(MIB).ok_or(Error::VolumeSize)?,
+            max: max.checked_mul(MIB).ok_or(Error::VolumeSize)?,
+        }))
+    }
+}
+
 impl FromStr for VolumeSize {
     type Err = Error;
 
     fn from_str(value: &str) -> Result<Self> {
         let (min, max) = value.split_once(':').ok_or(Error::VolumeSize)?;
-        let to_bytes = |number: &str| number.trim().parse::<u64>().ok()?.checked_mul(MIB);
-        let min = to_bytes(min).ok_or(Error::VolumeSize)?;
-        let max = to_bytes(max).ok_or(Error::VolumeSize)?;
-        if min == 0 || max < min {
-            return Err(Error::VolumeSize);
-        }
-        Ok(Self { min, max })
+        let parse = |number: &str| number.trim().parse::<u64>().map_err(|_| Error::VolumeSize);
+        Self::from_mib_bounds(Some(parse(min)?), Some(parse(max)?))?.ok_or(Error::VolumeSize)
     }
 }
 

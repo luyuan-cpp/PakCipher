@@ -23,8 +23,14 @@ enum Command {
         #[arg(short, long)]
         output: PathBuf,
         /// Write volumes into a new output directory with this size range.
-        #[arg(long, value_name = "MIN_MIB:MAX_MIB")]
+        #[arg(long, value_name = "MIN_MIB:MAX_MIB", conflicts_with_all = ["min_volume_size", "max_volume_size"])]
         volume_size: Option<VolumeSize>,
+        /// Minimum volume size. Defaults to 1 MiB when only the maximum is set.
+        #[arg(long, value_name = "MIB")]
+        min_volume_size: Option<u64>,
+        /// Maximum volume size. Defaults to twice the minimum when omitted in split mode.
+        #[arg(long, value_name = "MIB")]
+        max_volume_size: Option<u64>,
     },
     /// Restore an archive into a new folder.
     Decrypt {
@@ -47,9 +53,15 @@ fn run(args: Args) -> Result<(), Box<dyn Error>> {
             key_file,
             output,
             volume_size,
+            min_volume_size,
+            max_volume_size,
         } => {
+            let sizes = match volume_size {
+                Some(sizes) => Some(sizes),
+                None => VolumeSize::from_mib_bounds(min_volume_size, max_volume_size)?,
+            };
             let key = load_public_key(&key_file)?;
-            if let Some(sizes) = volume_size {
+            if let Some(sizes) = sizes {
                 pack_folder_volumes(&folder, &key, &output, sizes, |_, _| {})?;
             } else {
                 pack_folder(&folder, &key, &output, |_, _| {})?;

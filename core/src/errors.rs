@@ -12,7 +12,7 @@ pub enum Error {
     Authentication,
     #[error("Invalid or unsupported archive: {0}")]
     Format(&'static str),
-    #[error("Invalid volume size range. Use MIN:MAX in MiB with 1 <= MIN <= MAX.")]
+    #[error("Invalid volume bounds. Use whole MiB values with 1 <= minimum <= maximum.")]
     VolumeSize,
     #[error("Invalid volume set: {0}")]
     Volume(String),

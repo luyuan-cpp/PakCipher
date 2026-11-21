@@ -197,6 +197,41 @@ fn split_archives_require_every_intact_volume() {
     };
     assert!(!encrypt("3:1").status.success());
     assert!(!volumes.exists());
+    for (name, flags, min, max) in [
+        ("only-min", vec!["--min-volume-size", "2"], 2 * MIB, 4 * MIB),
+        ("only-max", vec!["--max-volume-size", "2"], MIB, 2 * MIB),
+        (
+            "both",
+            vec!["--min-volume-size", "3", "--max-volume-size", "4"],
+            3 * MIB,
+            4 * MIB,
+        ),
+    ] {
+        let output = path(name);
+        assert_success(
+            cli_command("encrypt", &source, &public, &output)
+                .args(flags)
+                .output()
+                .unwrap(),
+        );
+        let mut parts: Vec<_> = fs::read_dir(output)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        parts.sort();
+        assert!(parts.len() > 1);
+        for (index, part) in parts.iter().enumerate() {
+            let len = fs::metadata(part).unwrap().len();
+            assert!(len <= max);
+            assert!(index == parts.len() - 1 || len >= min);
+        }
+    }
+    let invalid = cli_command("encrypt", &source, &public, &volumes)
+        .args(["--min-volume-size", "4", "--max-volume-size", "3"])
+        .output()
+        .unwrap();
+    assert!(!invalid.status.success());
+    assert!(!volumes.exists());
     assert_success(encrypt("1:3"));
     let mut parts: Vec<_> = fs::read_dir(&volumes)
         .unwrap()

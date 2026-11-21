@@ -118,13 +118,13 @@ pakcipher decrypt ./photos.pak --key-file ./private.key --output ./photos-restor
 归档目前**不压缩**。输出总量约为源文件体积加上目录清单、认证标签和归档头。分卷限制单个文件的大小，对总量的影响仅是每卷增加 32 字节头部。
 
 ```sh
-pakcipher encrypt ./photos --key-file ./public.key --volume-size 10:100 --output ./photos-volumes
+pakcipher encrypt ./photos --key-file ./public.key --min-volume-size 10 --max-volume-size 100 --output ./photos-volumes
 pakcipher decrypt ./photos-volumes --key-file ./private.key --output ./photos-restored --ask-passphrase
 ```
 
-`--volume-size 10:100` 表示每卷随机选择 10 至 100 MiB 的大小，最后一卷可小于下限。最小值和最大值相同时使用固定大小。加密输出应是一个尚不存在的目录，内含 `part-000001.pak`、`part-000002.pak` 等文件。私钥没有口令时可省略 `--ask-passphrase`。
+`--min-volume-size` 和 `--max-volume-size` 可以单独或一起设定，单位为 MiB。只设置最大值时，最小值默认为 1 MiB；只设置最小值时，最大值默认为最小值的两倍。也可用 `--volume-size 10:100` 同时设置两个值。每卷大小在设定的范围内随机选取，最后一卷可小于下限。最小值和最大值相同时使用固定大小。加密输出应是一个尚不存在的目录，内含 `part-000001.pak`、`part-000002.pak` 等文件。私钥没有口令时可省略 `--ask-passphrase`。
 
-在 GUI 的 **Encrypt** 页填写 **Volume size range** 即可启用分卷，留空则继续生成单个 `.pak`。恢复时把同一组分卷放在同一目录，保持文件名不变。在 **Decrypt** 页选择第一卷，或在 CLI 传入第一卷或整个分卷目录。程序会检查所有分卷，再写出恢复结果，不需要预先合并。
+在 GUI 的 **Encrypt** 页可独立填写 **Minimum** 和 **Maximum**，两项都留空时生成单个 `.pak`。恢复时把同一组分卷放在同一目录，保持文件名不变。在 **Decrypt** 页选择第一卷，或在 CLI 传入第一卷或整个分卷目录。程序会检查所有分卷，再写出恢复结果，不需要预先合并。
 
 验证时可加密一个超过上限的样例目录，检查各卷大小，再比较恢复前后的内容。把中间或最后一个分卷临时移走后，尝试恢复到新路径，应报错且不创建输出目录。
 

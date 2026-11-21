@@ -52,7 +52,8 @@ struct App {
     page: Page,
     encrypt: Form,
     decrypt: Form,
-    volume_range: String,
+    min_volume_size: String,
+    max_volume_size: String,
     passphrase: Zeroizing<String>,
     job: Option<Job>,
     status: Option<(Page, bool, String)>,
@@ -124,7 +125,8 @@ impl App {
         } else {
             &mut self.decrypt
         };
-        let was_split = encrypting && !self.volume_range.trim().is_empty();
+        let was_split = encrypting
+            && (!self.min_volume_size.trim().is_empty() || !self.max_volume_size.trim().is_empty());
         let prior_default = default_output(Path::new(&form.source), encrypting, was_split);
         let use_default =
             form.output.is_empty() || prior_default.as_deref() == Some(Path::new(&form.output));
@@ -157,11 +159,21 @@ impl App {
             || rfd::FileDialog::new().pick_file(),
         );
         if encrypting {
-            ui.label("Volume size range (optional, in MiB)");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.volume_range)
-                    .hint_text("10:100, or leave empty for one .pak"),
-            );
+            ui.label("Volume sizes in MiB (leave both blank for one .pak)");
+            ui.horizontal(|ui| {
+                ui.label("Minimum");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.min_volume_size)
+                        .desired_width(110.0)
+                        .hint_text("Default: 1"),
+                );
+                ui.label("Maximum");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.max_volume_size)
+                        .desired_width(110.0)
+                        .hint_text("Default: 2 × min"),
+                );
+            });
         } else {
             ui.label("Private key passphrase (if protected)");
             let mut field = egui::TextEdit::singleline(&mut *self.passphrase)
@@ -171,14 +183,25 @@ impl App {
             field.state.clear_undoer();
             field.state.store(ui.ctx(), field.response.id);
         }
-        let range = self.volume_range.trim();
-        let split = encrypting && !range.is_empty();
-        let sizes = split.then(|| range.parse::<VolumeSize>());
-        let valid_sizes = sizes.as_ref().is_none_or(Result::is_ok);
+        let min = self.min_volume_size.trim();
+        let max = self.max_volume_size.trim();
+        let split = encrypting && (!min.is_empty() || !max.is_empty());
+        let sizes = if split {
+            let parse = |value: &str| {
+                (!value.is_empty())
+                    .then(|| value.parse::<u64>())
+                    .transpose()
+                    .map_err(|_| pakcipher_core::Error::VolumeSize)
+            };
+            parse(min).and_then(|min| VolumeSize::from_mib_bounds(min, parse(max)?))
+        } else {
+            Ok(None)
+        };
+        let valid_sizes = sizes.is_ok();
         if !valid_sizes {
             ui.colored_label(
                 ui.visuals().error_fg_color,
-                "Use MIN:MAX, with 1 ≤ MIN ≤ MAX.",
+                "Enter whole MiB values with 1 ≤ minimum ≤ maximum.",
             );
         }
         let suggested = default_output(Path::new(&form.source), encrypting, split);
@@ -225,7 +248,7 @@ impl App {
             let source = PathBuf::from(&form.source);
             let key_file = PathBuf::from(&form.key);
             let output = PathBuf::from(&form.output);
-            let sizes = sizes.and_then(Result::ok);
+            let sizes = sizes.ok().flatten();
             let passphrase = if encrypting {
                 Zeroizing::default()
             } else {

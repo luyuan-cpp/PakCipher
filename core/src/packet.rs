@@ -4,11 +4,13 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+use aes_gcm::{aead::AeadInPlace, Aes256Gcm};
 use hmac::Mac;
 
 use crate::{crypto::ArchiveMac, Error, Result};
 
-const HEADER: [u8; 12] = *b"PAKC\x01\x00\x00\x00\x00\x00\x00\x00";
+const HEADER_V1: [u8; 12] = *b"PAKC\x01\x00\x00\x00\x00\x00\x00\x00";
+const HEADER_V2: [u8; 12] = *b"PAKC\x02\x00\x00\x00\x00\x00\x00\x00";
 const MAX_CAPSULE: usize = 8 * 1024;
 const MAX_PATH: usize = 4096;
 pub(crate) const CHUNK: usize = 1024 * 1024;
@@ -16,8 +18,20 @@ pub(crate) const TAG: usize = 16;
 pub(crate) const FOOTER: u64 = 32;
 pub(crate) const DIRECTORY: u64 = u64::MAX;
 
+// File chunks use low chunk indices and entries never reach index u32::MAX.
+const ENTRY_FIELDS_NONCE: u64 = u64::MAX;
+const ENTRY_PATH_NONCE: u64 = u64::MAX - 1;
+const METADATA_AAD: &[u8] = b"PakCipher v2 metadata";
+
+#[derive(Clone, Copy)]
+pub(crate) enum ArchiveVersion {
+    V1,
+    V2,
+}
+
 pub(crate) fn write_header(
     writer: &mut impl Write,
+    cipher: &Aes256Gcm,
     wrapped: &[u8],
     count: u32,
     total: u64,
@@ -25,27 +39,44 @@ pub(crate) fn write_header(
     if wrapped.is_empty() || wrapped.len() > MAX_CAPSULE {
         return Err(Error::Format("invalid key capsule length"));
     }
-    writer.write_all(&HEADER)?;
+    writer.write_all(&HEADER_V2)?;
     writer.write_all(&(wrapped.len() as u32).to_le_bytes())?;
     writer.write_all(wrapped)?;
-    writer.write_all(&count.to_le_bytes())?;
-    writer.write_all(&total.to_le_bytes())?;
-    Ok(())
+    let mut fields = [0; 12];
+    fields[..4].copy_from_slice(&count.to_le_bytes());
+    fields[4..].copy_from_slice(&total.to_le_bytes());
+    write_metadata(writer, cipher, nonce(u32::MAX, 0), &mut fields)
 }
 
-pub(crate) fn read_header(reader: &mut impl Read) -> Result<(Vec<u8>, u32, u64)> {
-    if read_array::<12>(reader)? != HEADER {
-        return Err(Error::Format("unknown header or version"));
-    }
+pub(crate) fn read_capsule(reader: &mut impl Read) -> Result<(ArchiveVersion, Vec<u8>)> {
+    let version = match read_array::<12>(reader)? {
+        HEADER_V1 => ArchiveVersion::V1,
+        HEADER_V2 => ArchiveVersion::V2,
+        _ => return Err(Error::Format("unknown header or version")),
+    };
     let len = u32::from_le_bytes(read_array(reader)?) as usize;
     if len == 0 || len > MAX_CAPSULE {
         return Err(Error::Format("invalid key capsule length"));
     }
     let mut wrapped = vec![0; len];
     reader.read_exact(&mut wrapped)?;
-    let count = u32::from_le_bytes(read_array(reader)?);
-    let total = u64::from_le_bytes(read_array(reader)?);
-    Ok((wrapped, count, total))
+    Ok((version, wrapped))
+}
+
+pub(crate) fn read_manifest(
+    reader: &mut impl Read,
+    cipher: &Aes256Gcm,
+    version: ArchiveVersion,
+) -> Result<(u32, u64)> {
+    let mut fields = read_array::<12>(reader)?;
+    if matches!(version, ArchiveVersion::V2) {
+        decrypt_metadata(reader, cipher, nonce(u32::MAX, 0), &mut fields)?;
+    }
+    let (count, total) = fields.split_at(4);
+    Ok((
+        u32::from_le_bytes(count.try_into().unwrap()),
+        u64::from_le_bytes(total.try_into().unwrap()),
+    ))
 }
 
 pub(crate) fn entry_header(path: &str, size: u64) -> Vec<u8> {
@@ -56,17 +87,100 @@ pub(crate) fn entry_header(path: &str, size: u64) -> Vec<u8> {
     header
 }
 
-pub(crate) fn read_entry(reader: &mut impl Read) -> Result<(String, u64)> {
-    let len = u16::from_le_bytes(read_array(reader)?) as usize;
-    if len == 0 || len > MAX_PATH {
+pub(crate) fn encoded_entry_len(path: &str) -> u64 {
+    (10 + path.len() + 2 * TAG) as u64
+}
+
+pub(crate) fn write_entry(
+    writer: &mut impl Write,
+    cipher: &Aes256Gcm,
+    index: u32,
+    path: &str,
+    size: u64,
+) -> Result<()> {
+    let mut fields = [0; 10];
+    fields[..2].copy_from_slice(&(path.len() as u16).to_le_bytes());
+    fields[2..].copy_from_slice(&size.to_le_bytes());
+    write_metadata(
+        writer,
+        cipher,
+        nonce(index, ENTRY_FIELDS_NONCE),
+        &mut fields,
+    )?;
+    write_metadata(
+        writer,
+        cipher,
+        nonce(index, ENTRY_PATH_NONCE),
+        &mut path.as_bytes().to_vec(),
+    )
+}
+
+pub(crate) fn read_entry(
+    reader: &mut impl Read,
+    cipher: &Aes256Gcm,
+    version: ArchiveVersion,
+    index: u32,
+) -> Result<(String, u64)> {
+    if matches!(version, ArchiveVersion::V1) {
+        let len = u16::from_le_bytes(read_array(reader)?) as usize;
+        let path = parse_path(read_path_bytes(reader, len)?)?;
+        let size = u64::from_le_bytes(read_array(reader)?);
+        return Ok((path, size));
+    }
+    let mut fields = read_array::<10>(reader)?;
+    decrypt_metadata(
+        reader,
+        cipher,
+        nonce(index, ENTRY_FIELDS_NONCE),
+        &mut fields,
+    )?;
+    let (len, size) = fields.split_at(2);
+    let len = u16::from_le_bytes(len.try_into().unwrap()) as usize;
+    let size = u64::from_le_bytes(size.try_into().unwrap());
+    let mut path = read_path_bytes(reader, len)?;
+    decrypt_metadata(reader, cipher, nonce(index, ENTRY_PATH_NONCE), &mut path)?;
+    Ok((parse_path(path)?, size))
+}
+
+fn read_path_bytes(reader: &mut impl Read, len: usize) -> Result<Vec<u8>> {
+    if !(1..=MAX_PATH).contains(&len) {
         return Err(Error::Format("invalid entry path length"));
     }
     let mut bytes = vec![0; len];
     reader.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn parse_path(bytes: Vec<u8>) -> Result<String> {
     let path = String::from_utf8(bytes).map_err(|_| Error::Format("entry path is not UTF-8"))?;
     validate_path(&path)?;
-    let size = u64::from_le_bytes(read_array(reader)?);
-    Ok((path, size))
+    Ok(path)
+}
+
+fn write_metadata(
+    writer: &mut impl Write,
+    cipher: &Aes256Gcm,
+    iv: [u8; 12],
+    bytes: &mut [u8],
+) -> Result<()> {
+    let tag = cipher
+        .encrypt_in_place_detached(&iv.into(), METADATA_AAD, bytes)
+        .map_err(|_| Error::Authentication)?;
+    writer.write_all(bytes)?;
+    writer.write_all(&tag)?;
+    Ok(())
+}
+
+fn decrypt_metadata(
+    reader: &mut impl Read,
+    cipher: &Aes256Gcm,
+    iv: [u8; 12],
+    bytes: &mut [u8],
+) -> Result<()> {
+    let tag = read_array::<TAG>(reader)?;
+    cipher
+        .decrypt_in_place_detached(&iv.into(), METADATA_AAD, bytes, &tag.into())
+        .map_err(|_| Error::Authentication)
 }
 
 pub(crate) fn read_array<const N: usize>(reader: &mut impl Read) -> io::Result<[u8; N]> {
@@ -202,5 +316,51 @@ impl<R: Read> Read for Authenticated<R> {
         let read = self.io.read(data)?;
         self.mac.update(&data[..read]);
         Ok(read)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aes_gcm::KeyInit;
+
+    #[test]
+    fn v2_encrypts_and_authenticates_metadata() {
+        let cipher = Aes256Gcm::new_from_slice(&[0x33; 32]).unwrap();
+        let path = "private-project-7f9a/src/payment-credential.rs";
+        let size = 0x1398_ba7d_42c8_efd1_u64;
+        let count = 0x9741_ed76_u32;
+        let mut encoded = Vec::new();
+        write_header(&mut encoded, &cipher, b"key capsule", count, size).unwrap();
+        let entry_offset = encoded.len();
+        write_entry(&mut encoded, &cipher, 0, path, size).unwrap();
+        for plaintext in [path.as_bytes(), &size.to_le_bytes()] {
+            assert!(!encoded
+                .windows(plaintext.len())
+                .any(|bytes| bytes == plaintext));
+        }
+        let mut input = encoded.as_slice();
+        let (version, wrapped) = read_capsule(&mut input).unwrap();
+        assert!(matches!(version, ArchiveVersion::V2));
+        assert_eq!(wrapped, b"key capsule");
+        assert_eq!(
+            read_manifest(&mut input, &cipher, version).unwrap(),
+            (count, size)
+        );
+        assert_eq!(
+            read_entry(&mut input, &cipher, version, 0).unwrap(),
+            (path.into(), size)
+        );
+        assert!(input.is_empty());
+
+        // A damaged encrypted size or path must fail before it is used.
+        for offset in [entry_offset, entry_offset + 10 + TAG] {
+            let mut damaged = encoded.clone();
+            damaged[offset] ^= 1;
+            assert!(matches!(
+                read_entry(&mut &damaged[entry_offset..], &cipher, version, 0),
+                Err(Error::Authentication)
+            ));
+        }
     }
 }

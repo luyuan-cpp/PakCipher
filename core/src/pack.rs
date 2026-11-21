@@ -13,8 +13,9 @@ use zeroize::Zeroizing;
 use crate::{
     crypto::{derive_keys, wrap_seed},
     packet::{
-        create_directory, create_file, entry_header, is_link, nonce, output_path, relative_path,
-        write_header, Authenticated, CHUNK, DIRECTORY, FOOTER, TAG,
+        create_directory, create_file, encoded_entry_len, entry_header, is_link, nonce,
+        output_path, relative_path, write_entry, write_header, Authenticated, CHUNK, DIRECTORY,
+        FOOTER, TAG,
     },
     volume::VolumeWriter,
     Error, PublicKey, Result, VolumeSize,
@@ -96,7 +97,7 @@ fn pack(
     let (cipher, mac) = derive_keys(&seed);
     drop(seed);
     let mut archive_header = Vec::new();
-    write_header(&mut archive_header, &wrapped, count, total)?;
+    write_header(&mut archive_header, &cipher, &wrapped, count, total)?;
     let initial_len = total
         .checked_add(archive_header.len() as u64 + FOOTER)
         .ok_or(Error::Format("archive is too large"))?;
@@ -108,7 +109,7 @@ fn pack(
             } else {
                 chunk_count(entry.size) * TAG as u64
             };
-            len.checked_add(10 + entry.name.len() as u64 + tags)
+            len.checked_add(encoded_entry_len(&entry.name) + tags)
         })
         .ok_or(Error::Format("archive is too large"))?;
 
@@ -122,11 +123,11 @@ fn pack(
         let mut done = 0;
         progress(done, total);
         for (index, entry) in (0..count).zip(entries) {
-            let header = entry_header(&entry.name, entry.size);
-            writer.write_all(&header)?;
+            write_entry(&mut writer, &cipher, index, &entry.name, entry.size)?;
             if entry.size == DIRECTORY {
                 continue;
             }
+            let header = entry_header(&entry.name, entry.size);
 
             let metadata = fs::symlink_metadata(&entry.source)?;
             if is_link(&metadata) || !metadata.is_file() || metadata.len() != entry.size {

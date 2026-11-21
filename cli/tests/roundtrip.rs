@@ -53,6 +53,18 @@ fn assert_success(output: Output) {
     );
 }
 
+fn assert_hidden(archive: &[u8], markers: &[&str]) {
+    assert_eq!(&archive[..6], b"PAKC\x02\x00");
+    for marker in markers {
+        assert!(
+            !archive
+                .windows(marker.len())
+                .any(|bytes| bytes == marker.as_bytes()),
+            "{marker:?} leaked into the encrypted archive"
+        );
+    }
+}
+
 #[test]
 fn cli_roundtrip_and_archive_rejection() {
     let work = tempfile::tempdir().unwrap();
@@ -61,6 +73,11 @@ fn cli_roundtrip_and_archive_rejection() {
     fs::create_dir_all(source.join("nested/空目录")).unwrap();
     fs::write(source.join("empty.txt"), []).unwrap();
     fs::write(source.join("nested/notes.txt"), b"PakCipher").unwrap();
+    let secret_name = "private-workspace-c7ef";
+    let secret_file = "internal-service-routes-b48a.rs";
+    let secret_code = "fn generate_internal_report_b0ca() {}";
+    fs::create_dir(source.join(secret_name)).unwrap();
+    fs::write(source.join(secret_name).join(secret_file), secret_code).unwrap();
     let chunk: Vec<u8> = (0..1024 * 1024).map(|i| (i % 251) as u8).collect();
     {
         let mut file = File::create(source.join("nested/large.bin")).unwrap();
@@ -103,9 +120,17 @@ fn cli_roundtrip_and_archive_rejection() {
 
     let archive = path("archive.pak");
     assert_success(cli("encrypt", &source, &public, &archive));
+    assert_hidden(
+        &fs::read(&archive).unwrap(),
+        &[secret_name, secret_file, secret_code],
+    );
     let restored = path("restored");
     assert_success(cli("decrypt", &archive, &private, &restored));
     assert!(restored.join("nested/空目录").is_dir());
+    assert_eq!(
+        fs::read_to_string(restored.join(secret_name).join(secret_file)).unwrap(),
+        secret_code
+    );
     assert_eq!(
         fs::read(restored.join("nested/notes.txt")).unwrap(),
         b"PakCipher"
@@ -259,12 +284,16 @@ fn split_archives_require_every_intact_volume() {
         .collect();
     parts.sort();
     assert!(parts.len() >= 4);
+    let mut logical_archive = Vec::new();
     for (i, part) in parts.iter().enumerate() {
         assert_eq!(part, &volumes.join(format!("part-{:06}.pak", i + 1)));
         let size = fs::metadata(part).unwrap().len();
         assert!(size <= 3 * MIB);
         assert!(i == parts.len() - 1 || size >= MIB);
+        let bytes = fs::read(part).unwrap();
+        logical_archive.extend_from_slice(&bytes[32..]);
     }
+    assert_hidden(&logical_archive, &["nested/empty", "nested/data.bin"]);
     assert!(!encrypt("1:3").status.success());
 
     for (input, output) in [

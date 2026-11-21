@@ -89,7 +89,7 @@ impl eframe::App for App {
             if self.page == Page::About {
                 ui.label("Offline folder encryption and restoration.");
                 ui.label("Encrypt with the recipient's OpenPGP RSA public key.");
-                ui.label("Archive names and sizes are visible. File contents are encrypted.");
+                ui.label("New archives encrypt paths, file sizes, and file contents.");
             } else if self.page == Page::Keys {
                 ui.add_enabled_ui(self.job.is_none(), |ui| self.show_keys(ui));
             } else {

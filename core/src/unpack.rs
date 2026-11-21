@@ -12,8 +12,8 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::{
     crypto::{derive_keys, unwrap_seed},
     packet::{
-        create_directory, create_file, entry_header, nonce, output_path, read_array, read_entry,
-        read_header, Authenticated, CHUNK, DIRECTORY, FOOTER, TAG,
+        create_directory, create_file, entry_header, nonce, output_path, read_array, read_capsule,
+        read_entry, read_manifest, Authenticated, CHUNK, DIRECTORY, FOOTER, TAG,
     },
     volume::ArchiveInput,
     Error, PrivateKey, Result,
@@ -32,7 +32,7 @@ pub fn unpack_packet(
         .len()?
         .checked_sub(FOOTER)
         .ok_or(Error::Format("missing authentication footer"))?;
-    let (wrapped, _, _) = read_header(&mut (&mut source).take(body_len))?;
+    let (_, wrapped) = read_capsule(&mut (&mut source).take(body_len))?;
     let seed = unwrap_seed(key, passphrase, &wrapped)?;
     let (cipher, mac) = derive_keys(&seed);
     drop(seed);
@@ -59,13 +59,14 @@ pub fn unpack_packet(
             io: (&mut source).take(body_len),
             mac,
         };
-        let (_, count, total) = read_header(&mut reader)?;
+        let (version, _) = read_capsule(&mut reader)?;
+        let (count, total) = read_manifest(&mut reader, &cipher, version)?;
         let mut directories = HashSet::new();
         let mut buffer = Zeroizing::new(vec![0; CHUNK]);
         let mut done = 0;
         progress(done, total);
         for index in 0..count {
-            let (name, size) = read_entry(&mut reader)?;
+            let (name, size) = read_entry(&mut reader, &cipher, version, index)?;
             if let Some((parent, _)) = name.rsplit_once('/') {
                 if !directories.contains(parent) {
                     return Err(Error::Format("parent directory is missing"));

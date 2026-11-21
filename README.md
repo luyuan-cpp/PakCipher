@@ -1,6 +1,6 @@
 # PakCipher
 
-PakCipher 是一个离线文件夹加密工具。使用接收方的 OpenPGP RSA 公钥生成单个 `.pak` 文件，再用对应的私钥恢复原始目录结构。CLI 和桌面 GUI 共用同一套归档格式。
+PakCipher 是一个离线文件夹加密工具。使用接收方的 OpenPGP RSA 公钥生成单个 `.pak` 文件或一组加密分卷，再用对应的私钥恢复原始目录结构。CLI 和桌面 GUI 共用同一套归档格式。
 
 ## 构建和运行
 
@@ -113,6 +113,21 @@ pakcipher decrypt ./photos.pak --key-file ./private.key --output ./photos-restor
 
 打开 `pakcipher-gui`，在 **Encrypt** 页选择源目录、公钥和归档路径，或在 **Decrypt** 页选择归档、私钥和新的输出目录。加密和解密在后台运行，各自的页面会显示进度和操作结果，成功后保留 100% 进度条。使用受保护私钥时，在解密页输入口令。
 
+## 大目录分卷
+
+归档目前**不压缩**。输出总量约为源文件体积加上目录清单、认证标签和归档头。分卷限制单个文件的大小，对总量的影响仅是每卷增加 32 字节头部。
+
+```sh
+pakcipher encrypt ./photos --key-file ./public.key --volume-size 10:100 --output ./photos-volumes
+pakcipher decrypt ./photos-volumes --key-file ./private.key --output ./photos-restored --ask-passphrase
+```
+
+`--volume-size 10:100` 表示每卷随机选择 10 至 100 MiB 的大小，最后一卷可小于下限。最小值和最大值相同时使用固定大小。加密输出应是一个尚不存在的目录，内含 `part-000001.pak`、`part-000002.pak` 等文件。私钥没有口令时可省略 `--ask-passphrase`。
+
+在 GUI 的 **Encrypt** 页填写 **Volume size range** 即可启用分卷，留空则继续生成单个 `.pak`。恢复时把同一组分卷放在同一目录，保持文件名不变。在 **Decrypt** 页选择第一卷，或在 CLI 传入第一卷或整个分卷目录。程序会检查所有分卷，再写出恢复结果，不需要预先合并。
+
+验证时可加密一个超过上限的样例目录，检查各卷大小，再比较恢复前后的内容。把中间或最后一个分卷临时移走后，尝试恢复到新路径，应报错且不创建输出目录。
+
 ## 归档格式 v1
 
 整数使用小端序。头部为 `PAKC`、两字节版本号 `1` 和六字节保留字段。头部之后依次是 `u32` 密钥封装长度、OpenPGP RSA 加密的 32 字节随机种子封装、`u32` 条目数、`u64` 明文字节总数和条目序列。封装本身是一个 OpenPGP 加密消息。
@@ -122,3 +137,5 @@ pakcipher decrypt ./photos.pak --key-file ./private.key --output ./photos-restor
 HKDF-SHA256 从归档种子派生两个独立的 32 字节密钥。盐为 `PakCipher v1`，两次派生的 info 分别为 `content AES-256-GCM` 和 `archive HMAC-SHA256`，均为 ASCII 字节。32 字节 HMAC-SHA256 尾部覆盖前面所有字节。恢复前先验证整个归档的 HMAC，写入文件前再验证对应块的 GCM 标签。
 
 文件名、目录名和大小可从归档读取。空目录会恢复，符号链接和 Windows 重解析点会被拒绝。归档保存目录结构和文件内容。使用由自己控制的源目录和输出上级目录，操作期间避免并发修改。进程被强制终止时，可能留下未完成的输出。
+
+分卷在同一逻辑归档流外加一层封装。每卷以 32 字节头部开头，依次为 `PKV1`、从 1 开始的 `u32` 卷号、逻辑归档总长度 `u64` 和 16 字节的随机卷组标识。按卷号读取各卷去掉头部后的内容，即得到原始的 v1 归档流。

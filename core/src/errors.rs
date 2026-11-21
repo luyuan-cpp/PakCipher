@@ -12,6 +12,10 @@ pub enum Error {
     Authentication,
     #[error("Invalid or unsupported archive: {0}")]
     Format(&'static str),
+    #[error("Invalid volume size range. Use MIN:MAX in MiB with 1 <= MIN <= MAX.")]
+    VolumeSize,
+    #[error("Invalid volume set: {0}")]
+    Volume(String),
     #[error("Unsupported path: {0}")]
     Path(String),
     #[error("Output must be outside the source folder.")]

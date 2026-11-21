@@ -69,7 +69,7 @@ pub(crate) fn read_entry(reader: &mut impl Read) -> Result<(String, u64)> {
     Ok((path, size))
 }
 
-pub(crate) fn read_array<const N: usize>(reader: &mut impl Read) -> Result<[u8; N]> {
+pub(crate) fn read_array<const N: usize>(reader: &mut impl Read) -> io::Result<[u8; N]> {
     let mut bytes = [0; N];
     reader.read_exact(&mut bytes)?;
     Ok(bytes)

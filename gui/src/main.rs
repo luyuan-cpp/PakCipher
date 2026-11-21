@@ -15,7 +15,9 @@ use std::{
 };
 
 use eframe::egui;
-use pakcipher_core::{load_private_key, load_public_key, pack_folder, unpack_packet};
+use pakcipher_core::{
+    load_private_key, load_public_key, pack_folder, pack_folder_volumes, unpack_packet, VolumeSize,
+};
 use zeroize::Zeroizing;
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -50,6 +52,7 @@ struct App {
     page: Page,
     encrypt: Form,
     decrypt: Form,
+    volume_range: String,
     passphrase: Zeroizing<String>,
     job: Option<Job>,
     status: Option<(Page, bool, String)>,
@@ -121,15 +124,16 @@ impl App {
         } else {
             &mut self.decrypt
         };
-        let prior_default = default_output(Path::new(&form.source), encrypting);
+        let was_split = encrypting && !self.volume_range.trim().is_empty();
+        let prior_default = default_output(Path::new(&form.source), encrypting, was_split);
         let use_default =
             form.output.is_empty() || prior_default.as_deref() == Some(Path::new(&form.output));
-        let source = path_field(
+        let source_changed = path_field(
             ui,
             if encrypting {
                 "Source folder"
             } else {
-                "Archive"
+                "Archive or first volume (part-000001.pak)"
             },
             &mut form.source,
             || {
@@ -142,14 +146,6 @@ impl App {
                 }
             },
         );
-        if source && use_default {
-            form.output = default_output(Path::new(&form.source), encrypting)
-                .map(|path| path.to_string_lossy().into_owned())
-                .unwrap_or_default();
-        }
-        let restored_name = default_output(Path::new(&form.source), false)
-            .and_then(|path| path.file_name().map(|name| name.to_owned()))
-            .unwrap_or_else(|| "restored".into());
         path_field(
             ui,
             if encrypting {
@@ -160,7 +156,13 @@ impl App {
             &mut form.key,
             || rfd::FileDialog::new().pick_file(),
         );
-        if !encrypting {
+        if encrypting {
+            ui.label("Volume size range (optional, in MiB)");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.volume_range)
+                    .hint_text("10:100, or leave empty for one .pak"),
+            );
+        } else {
             ui.label("Private key passphrase (if protected)");
             let mut field = egui::TextEdit::singleline(&mut *self.passphrase)
                 .password(true)
@@ -169,32 +171,61 @@ impl App {
             field.state.clear_undoer();
             field.state.store(ui.ctx(), field.response.id);
         }
+        let range = self.volume_range.trim();
+        let split = encrypting && !range.is_empty();
+        let sizes = split.then(|| range.parse::<VolumeSize>());
+        let valid_sizes = sizes.as_ref().is_none_or(Result::is_ok);
+        if !valid_sizes {
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                "Use MIN:MAX, with 1 ≤ MIN ≤ MAX.",
+            );
+        }
+        let suggested = default_output(Path::new(&form.source), encrypting, split);
+        if use_default && (source_changed || was_split != split) {
+            form.output = suggested
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default();
+        }
         path_field(
             ui,
-            if encrypting {
+            if split {
+                "New volume folder"
+            } else if encrypting {
                 "New archive"
             } else {
                 "New output folder"
             },
             &mut form.output,
             || {
-                if encrypting {
+                if encrypting && !split {
                     rfd::FileDialog::new()
                         .add_filter("PakCipher archive", &["pak"])
                         .save_file()
                 } else {
+                    let name = suggested
+                        .as_ref()
+                        .and_then(|path| path.file_name())
+                        .unwrap_or_else(|| {
+                            std::ffi::OsStr::new(if split { "volumes" } else { "restored" })
+                        });
                     rfd::FileDialog::new()
                         .pick_folder()
-                        .map(|path| path.join(restored_name))
+                        .map(|path| path.join(name))
                 }
             },
         );
-        let ready = !form.source.is_empty() && !form.key.is_empty() && !form.output.is_empty();
+        let ready = valid_sizes
+            && !form.source.is_empty()
+            && !form.key.is_empty()
+            && !form.output.is_empty();
         let label = if encrypting { "Encrypt" } else { "Restore" };
         if ui.add_enabled(ready, egui::Button::new(label)).clicked() {
             let source = PathBuf::from(&form.source);
             let key_file = PathBuf::from(&form.key);
             let output = PathBuf::from(&form.output);
+            let sizes = sizes.and_then(Result::ok);
             let passphrase = if encrypting {
                 Zeroizing::default()
             } else {
@@ -212,8 +243,13 @@ impl App {
                         worker_progress.done.store(done, Ordering::Relaxed);
                     };
                     let outcome = if encrypting {
-                        load_public_key(&key_file)
-                            .and_then(|key| pack_folder(&source, &key, &output, report))
+                        load_public_key(&key_file).and_then(|key| {
+                            if let Some(sizes) = sizes {
+                                pack_folder_volumes(&source, &key, &output, sizes, report)
+                            } else {
+                                pack_folder(&source, &key, &output, report)
+                            }
+                        })
                     } else {
                         load_private_key(&key_file).and_then(|key| {
                             unpack_packet(&source, &key, &passphrase, &output, report)
@@ -246,14 +282,29 @@ impl App {
     }
 }
 
-fn default_output(source: &Path, encrypting: bool) -> Option<PathBuf> {
+fn default_output(mut source: &Path, encrypting: bool, split: bool) -> Option<PathBuf> {
+    if !encrypting
+        && source
+            .file_name()
+            .is_some_and(|name| name == "part-000001.pak")
+    {
+        if let Some(folder) = source.parent().filter(|path| path.file_name().is_some()) {
+            source = folder;
+        }
+    }
     let mut name = if encrypting {
         source.file_name()?
     } else {
         source.file_stem()?
     }
     .to_os_string();
-    name.push(if encrypting { ".pak" } else { "-restored" });
+    name.push(if split {
+        "-volumes"
+    } else if encrypting {
+        ".pak"
+    } else {
+        "-restored"
+    });
     Some(source.with_file_name(name))
 }
 

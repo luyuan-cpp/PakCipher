@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
-    fs::{self, File},
-    io::{self, BufReader, Read, Seek, Write},
+    fs,
+    io::{self, Read, Write},
     path::Path,
 };
 
@@ -15,6 +15,7 @@ use crate::{
         create_directory, create_file, entry_header, nonce, output_path, read_array, read_entry,
         read_header, Authenticated, CHUNK, DIRECTORY, FOOTER, TAG,
     },
+    volume::ArchiveInput,
     Error, PrivateKey, Result,
 };
 
@@ -26,11 +27,9 @@ pub fn unpack_packet(
     progress: impl Fn(u64, u64),
 ) -> Result<()> {
     let output = output_path(output)?;
-    let mut source = BufReader::new(File::open(packet)?);
+    let mut source = ArchiveInput::open(packet)?;
     let body_len = source
-        .get_ref()
-        .metadata()?
-        .len()
+        .len()?
         .checked_sub(FOOTER)
         .ok_or(Error::Format("missing authentication footer"))?;
     let (wrapped, _, _) = read_header(&mut (&mut source).take(body_len))?;

@@ -1,7 +1,9 @@
 use std::{error::Error, path::PathBuf, process::ExitCode};
 
 use clap::{Parser, Subcommand};
-use pakcipher_core::{load_private_key, load_public_key, pack_folder, unpack_packet};
+use pakcipher_core::{
+    load_private_key, load_public_key, pack_folder, pack_folder_volumes, unpack_packet, VolumeSize,
+};
 use zeroize::Zeroizing;
 
 #[derive(Parser)]
@@ -13,16 +15,20 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Encrypt a folder into a new .pak file.
+    /// Encrypt a folder into a .pak or a directory of .pak volumes.
     Encrypt {
         folder: PathBuf,
         #[arg(long)]
         key_file: PathBuf,
         #[arg(short, long)]
         output: PathBuf,
+        /// Write volumes into a new output directory with this size range.
+        #[arg(long, value_name = "MIN_MIB:MAX_MIB")]
+        volume_size: Option<VolumeSize>,
     },
     /// Restore an archive into a new folder.
     Decrypt {
+        /// A .pak file, the first .pak volume, or a volume directory.
         archive: PathBuf,
         #[arg(long)]
         key_file: PathBuf,
@@ -40,8 +46,14 @@ fn run(args: Args) -> Result<(), Box<dyn Error>> {
             folder,
             key_file,
             output,
+            volume_size,
         } => {
-            pack_folder(&folder, &load_public_key(&key_file)?, &output, |_, _| {})?;
+            let key = load_public_key(&key_file)?;
+            if let Some(sizes) = volume_size {
+                pack_folder_volumes(&folder, &key, &output, sizes, |_, _| {})?;
+            } else {
+                pack_folder(&folder, &key, &output, |_, _| {})?;
+            }
         }
         Command::Decrypt {
             archive,

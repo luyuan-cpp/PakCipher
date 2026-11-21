@@ -12,10 +12,11 @@ use zeroize::Zeroizing;
 use crate::{
     crypto::{derive_keys, wrap_seed},
     packet::{
-        create_file, entry_header, is_link, nonce, output_path, relative_path, write_header,
-        Authenticated, CHUNK, DIRECTORY,
+        create_directory, create_file, entry_header, is_link, nonce, output_path, relative_path,
+        write_header, Authenticated, CHUNK, DIRECTORY, FOOTER, TAG,
     },
-    Error, PublicKey, Result,
+    volume::VolumeWriter,
+    Error, PublicKey, Result, VolumeSize,
 };
 
 struct Entry {
@@ -28,6 +29,26 @@ pub fn pack_folder(
     folder: &Path,
     key: &PublicKey,
     output: &Path,
+    progress: impl Fn(u64, u64),
+) -> Result<()> {
+    pack(folder, key, output, None, progress)
+}
+
+pub fn pack_folder_volumes(
+    folder: &Path,
+    key: &PublicKey,
+    output: &Path,
+    sizes: VolumeSize,
+    progress: impl Fn(u64, u64),
+) -> Result<()> {
+    pack(folder, key, output, Some(sizes), progress)
+}
+
+fn pack(
+    folder: &Path,
+    key: &PublicKey,
+    output: &Path,
+    volume_sizes: Option<VolumeSize>,
     progress: impl Fn(u64, u64),
 ) -> Result<()> {
     let root = folder.canonicalize()?;
@@ -72,14 +93,29 @@ pub fn pack_folder(
     let (seed, wrapped) = wrap_seed(key)?;
     let (cipher, mac) = derive_keys(&seed);
     drop(seed);
-    let file = create_file(&output)?;
+    let mut archive_header = Vec::new();
+    write_header(&mut archive_header, &wrapped, count, total)?;
+    let initial_len = total
+        .checked_add(archive_header.len() as u64 + FOOTER)
+        .ok_or(Error::Format("archive is too large"))?;
+    let archive_len = entries
+        .iter()
+        .try_fold(initial_len, |len, entry| {
+            let tags = if entry.size == DIRECTORY {
+                0
+            } else {
+                chunk_count(entry.size) * TAG as u64
+            };
+            len.checked_add(10 + entry.name.len() as u64 + tags)
+        })
+        .ok_or(Error::Format("archive is too large"))?;
 
-    let result = (|| {
+    let emit = |destination: &mut dyn Write| {
         let mut writer = Authenticated {
-            io: BufWriter::new(file),
+            io: BufWriter::new(destination),
             mac,
         };
-        write_header(&mut writer, &wrapped, count, total)?;
+        writer.write_all(&archive_header)?;
         let mut buffer = Zeroizing::new(vec![0; CHUNK]);
         let mut done = 0;
         progress(done, total);
@@ -96,7 +132,7 @@ pub fn pack_folder(
             }
             let mut source = File::open(&entry.source)?;
             let mut remaining = entry.size;
-            for part in 0..entry.size.div_ceil(CHUNK as u64).max(1) {
+            for part in 0..chunk_count(entry.size) {
                 let len = remaining.min(CHUNK as u64) as usize;
                 let data = &mut buffer[..len];
                 source.read_exact(data)?;
@@ -117,9 +153,27 @@ pub fn pack_folder(
         writer.io.write_all(&writer.mac.finalize().into_bytes())?;
         writer.io.flush()?;
         Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&output);
+    };
+    if let Some(sizes) = volume_sizes {
+        let mut volumes = VolumeWriter::new(&output, sizes, archive_len)?;
+        create_directory(&output)?;
+        let result = emit(&mut volumes).and_then(|()| volumes.finish());
+        drop(volumes);
+        if result.is_err() {
+            let _ = fs::remove_dir_all(&output);
+        }
+        result
+    } else {
+        let mut file = create_file(&output)?;
+        let result = emit(&mut file);
+        drop(file);
+        if result.is_err() {
+            let _ = fs::remove_file(&output);
+        }
+        result
     }
-    result
+}
+
+fn chunk_count(size: u64) -> u64 {
+    size.div_ceil(CHUNK as u64).max(1)
 }

@@ -30,15 +30,19 @@ fn rsa_key(passphrase: Option<&str>) -> SignedSecretKey {
 }
 
 fn cli(action: &str, input: &Path, key: &Path, output: &Path) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_pakcipher"))
+    cli_command(action, input, key, output).output().unwrap()
+}
+
+fn cli_command(action: &str, input: &Path, key: &Path, output: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pakcipher"));
+    command
         .arg(action)
         .arg(input)
         .arg("--key-file")
         .arg(key)
         .arg("--output")
-        .arg(output)
-        .output()
-        .unwrap()
+        .arg(output);
+    command
 }
 
 fn assert_success(output: Output) {
@@ -161,4 +165,94 @@ fn protected_key_and_empty_directory() {
     assert!(!restored.exists());
     unpack_packet(&archive, &key, passphrase, &restored, |_, _| {}).unwrap();
     assert_eq!(fs::read_dir(restored).unwrap().count(), 0);
+}
+
+#[test]
+fn split_archives_require_every_intact_volume() {
+    const MIB: u64 = 1024 * 1024;
+    let work = tempfile::tempdir().unwrap();
+    let path = |name: &str| work.path().join(name);
+    let source = path("source");
+    fs::create_dir_all(source.join("nested/empty")).unwrap();
+    let data: Vec<u8> = (0..9 * MIB as usize).map(|i| (i % 251) as u8).collect();
+    fs::write(source.join("nested/data.bin"), &data).unwrap();
+    let key = rsa_key(None);
+    let public = path("public.key");
+    let private = path("private.key");
+    fs::write(
+        &public,
+        key.to_public_key()
+            .to_armored_bytes(Default::default())
+            .unwrap(),
+    )
+    .unwrap();
+    fs::write(&private, key.to_armored_bytes(Default::default()).unwrap()).unwrap();
+
+    let volumes = path("volumes");
+    let encrypt = |range| {
+        cli_command("encrypt", &source, &public, &volumes)
+            .args(["--volume-size", range])
+            .output()
+            .unwrap()
+    };
+    assert!(!encrypt("3:1").status.success());
+    assert!(!volumes.exists());
+    assert_success(encrypt("1:3"));
+    let mut parts: Vec<_> = fs::read_dir(&volumes)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    parts.sort();
+    assert!(parts.len() >= 4);
+    for (i, part) in parts.iter().enumerate() {
+        assert_eq!(part, &volumes.join(format!("part-{:06}.pak", i + 1)));
+        let size = fs::metadata(part).unwrap().len();
+        assert!(size <= 3 * MIB);
+        assert!(i == parts.len() - 1 || size >= MIB);
+    }
+    assert!(!encrypt("1:3").status.success());
+
+    for (input, output) in [
+        (&volumes, path("from-dir")),
+        (&parts[0], path("from-first")),
+    ] {
+        assert_success(cli("decrypt", input, &private, &output));
+        assert!(output.join("nested/empty").is_dir());
+        assert!(fs::read(output.join("nested/data.bin")).unwrap() == data);
+    }
+
+    let rejected = path("rejected");
+    let reject = |expected: &str| {
+        let result = cli("decrypt", &volumes, &private, &rejected);
+        assert!(!result.status.success());
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(stderr.contains(expected), "{stderr}");
+        assert!(!rejected.exists());
+    };
+    let displaced = path("missing.pak");
+    for (part, reason) in [
+        (&parts[1], "missing part-000002.pak"),
+        (parts.last().unwrap(), "missing, truncated"),
+    ] {
+        fs::rename(part, &displaced).unwrap();
+        reject(reason);
+        fs::rename(&displaced, part).unwrap();
+    }
+    for (offset, reason) in [(16, "does not belong"), (32, "authentication failed")] {
+        let mut part = File::options()
+            .read(true)
+            .write(true)
+            .open(&parts[1])
+            .unwrap();
+        part.seek(SeekFrom::Start(offset)).unwrap();
+        let mut byte = [0];
+        part.read_exact(&mut byte).unwrap();
+        part.seek(SeekFrom::Start(offset)).unwrap();
+        part.write_all(&[byte[0] ^ 1]).unwrap();
+        drop(part);
+        reject(reason);
+        let mut part = File::options().write(true).open(&parts[1]).unwrap();
+        part.seek(SeekFrom::Start(offset)).unwrap();
+        part.write_all(&byte).unwrap();
+    }
 }

@@ -117,6 +117,10 @@ pakcipher decrypt ./photos.pak --key-file ./private.key --output ./photos-restor
 
 打开 `pakcipher-gui`，在 **Encrypt** 页选择源目录、公钥和归档路径，或在 **Decrypt** 页选择归档、私钥和新的输出目录。加密和解密在后台运行，各自的页面会显示进度和操作结果，成功后保留 100% 进度条。使用受保护私钥时，在解密页输入口令。
 
+GUI 在本机用户配置中分别保存 **Encrypt** 页的公钥文件路径和 **Decrypt** 页的私钥文件路径，重启时自动填入。清空对应字段并正常退出即可清除记忆。配置只保存两个路径，不保存密钥内容、口令、源目录或输出路径。
+
+也可以把一个目录拖到 **Encrypt** 页右侧的 **Drop a folder here** 区域。再次拖入新目录会替换源目录，自动建议的输出路径会随之更新，手动指定的输出路径会保留。Windows、macOS 和 Linux X11 支持此操作。原生 Wayland 会话请使用 **Browse…** 选择目录。如果桌面提供 XWayland，也可用 `env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET ./pakcipher-gui` 在 X11 模式下启动。
+
 ## 大目录分卷
 
 归档目前**不压缩**。输出总量约为源文件体积加上目录清单、认证标签和归档头。分卷限制单个文件的大小，对总量的影响仅是每卷增加 32 字节头部。

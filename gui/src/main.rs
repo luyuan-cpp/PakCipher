@@ -21,6 +21,11 @@ use pakcipher_core::{
 };
 use zeroize::{Zeroize, Zeroizing};
 
+mod folder_drop;
+
+const PUBLIC_KEY_PATH: &str = "public_key_path";
+const PRIVATE_KEY_PATH: &str = "private_key_path";
+
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum Page {
     #[default]
@@ -69,10 +74,11 @@ struct App {
     job: Option<Job>,
     close_after_job: bool,
     status: Option<(Page, bool, String)>,
+    drop_error: Option<&'static str>,
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.poll();
         if self.handle_close_request(ctx) {
             return;
@@ -92,8 +98,32 @@ impl eframe::App for App {
                 ui.label("New archives encrypt paths, file sizes, and file contents.");
             } else if self.page == Page::Keys {
                 ui.add_enabled_ui(self.job.is_none(), |ui| self.show_keys(ui));
+            } else if self.page == Page::Encrypt {
+                ui.add_enabled_ui(self.job.is_none(), |ui| {
+                    ui.columns_const(|[form, drop_zone]| {
+                        let supported = folder_drop::is_available(frame);
+                        let area = folder_drop::show_zone(drop_zone, supported);
+                        let position = if supported
+                            && self.job.is_none()
+                            && ctx.input(|input| !input.raw.dropped_files.is_empty())
+                        {
+                            folder_drop::cursor_position(frame, ctx)
+                        } else {
+                            None
+                        };
+                        let dropped = position.and_then(|position| {
+                            ctx.input(|input| {
+                                self.folder_dropped_at(area, position, &input.raw.dropped_files)
+                            })
+                        });
+                        self.show_form(form, dropped);
+                        if let Some(error) = self.drop_error {
+                            drop_zone.colored_label(drop_zone.visuals().error_fg_color, error);
+                        }
+                    });
+                });
             } else {
-                ui.add_enabled_ui(self.job.is_none(), |ui| self.show_form(ui));
+                ui.add_enabled_ui(self.job.is_none(), |ui| self.show_form(ui, None));
             }
 
             if let Some(job) = &self.job {
@@ -137,9 +167,48 @@ impl eframe::App for App {
             }
         });
     }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        storage.set_string(PUBLIC_KEY_PATH, self.encrypt.key.clone());
+        storage.set_string(PRIVATE_KEY_PATH, self.decrypt.key.clone());
+    }
+
+    fn persist_egui_memory(&self) -> bool {
+        false
+    }
 }
 
 impl App {
+    fn with_storage(storage: Option<&dyn eframe::Storage>) -> Self {
+        let mut app = Self::default();
+        if let Some(storage) = storage {
+            app.encrypt.key = storage.get_string(PUBLIC_KEY_PATH).unwrap_or_default();
+            app.decrypt.key = storage.get_string(PRIVATE_KEY_PATH).unwrap_or_default();
+        }
+        app
+    }
+
+    fn folder_dropped_at(
+        &mut self,
+        area: egui::Rect,
+        position: egui::Pos2,
+        files: &[egui::DroppedFile],
+    ) -> Option<String> {
+        if !area.contains(position) {
+            return None;
+        }
+        match folder_drop::folder(files) {
+            Ok(path) => {
+                self.drop_error = None;
+                Some(path.to_owned())
+            }
+            Err(message) => {
+                self.drop_error = Some(message);
+                None
+            }
+        }
+    }
+
     fn handle_close_request(&mut self, ctx: &egui::Context) -> bool {
         let close_requested = ctx.input(|input| input.viewport().close_requested());
         if self.job.is_some() {
@@ -201,7 +270,7 @@ impl App {
         }
     }
 
-    fn show_form(&mut self, ui: &mut egui::Ui) {
+    fn show_form(&mut self, ui: &mut egui::Ui, dropped: Option<String>) {
         let encrypting = self.page == Page::Encrypt;
         let form = if encrypting {
             &mut self.encrypt
@@ -213,7 +282,11 @@ impl App {
         let prior_default = default_output(Path::new(&form.source), encrypting, was_split);
         let use_default =
             form.output.is_empty() || prior_default.as_deref() == Some(Path::new(&form.output));
-        let source_changed = path_field(
+        let replaced_by_drop = dropped.is_some();
+        if let Some(path) = dropped {
+            form.source = path;
+        }
+        let source_edited = path_field(
             ui,
             if encrypting {
                 "Source folder"
@@ -231,6 +304,9 @@ impl App {
                 }
             },
         );
+        if encrypting && source_edited {
+            self.drop_error = None;
+        }
         path_field(
             ui,
             if encrypting {
@@ -286,7 +362,7 @@ impl App {
             );
         }
         let suggested = default_output(Path::new(&form.source), encrypting, split);
-        if use_default && (source_changed || was_split != split) {
+        if use_default && (replaced_by_drop || source_edited || was_split != split) {
             form.output = suggested
                 .as_ref()
                 .map(|path| path.to_string_lossy().into_owned())
@@ -457,19 +533,116 @@ fn path_field(
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([640.0, 360.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([740.0, 360.0])
+            .with_min_inner_size([620.0, 360.0]),
+        persist_window: false,
         ..Default::default()
     };
     eframe::run_native(
         "PakCipher",
         options,
-        Box::new(|_| Ok(Box::new(App::default()))),
+        Box::new(|context| Ok(Box::new(App::with_storage(context.storage)))),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eframe::App as _;
+
+    #[derive(Default)]
+    struct TestStorage(std::collections::HashMap<String, String>);
+
+    impl eframe::Storage for TestStorage {
+        fn get_string(&self, key: &str) -> Option<String> {
+            self.0.get(key).cloned()
+        }
+
+        fn set_string(&mut self, key: &str, value: String) {
+            self.0.insert(key.to_owned(), value);
+        }
+
+        fn flush(&mut self) {}
+    }
+
+    #[test]
+    fn restores_only_key_paths_and_preserves_cleared_fields() {
+        let mut storage = TestStorage::default();
+        let mut app = App::with_storage(Some(&storage));
+        assert!(app.encrypt.key.is_empty() && app.decrypt.key.is_empty());
+        app.encrypt.key = "keys/收件人 public.key".into();
+        app.decrypt.key = "keys/我的 private.key".into();
+        app.encrypt.source = "a folder".into();
+        app.decrypt.output = "a restored folder".into();
+        app.passphrase.push_str("a passphrase");
+
+        app.save(&mut storage);
+        assert_eq!(storage.0.len(), 2);
+        let mut restored = App::with_storage(Some(&storage));
+        assert_eq!(restored.encrypt.key, app.encrypt.key);
+        assert_eq!(restored.decrypt.key, app.decrypt.key);
+        assert!(restored.encrypt.source.is_empty());
+        assert!(restored.decrypt.output.is_empty());
+        assert!(restored.passphrase.is_empty());
+
+        restored.encrypt.key.clear();
+        restored.save(&mut storage);
+        let restored = App::with_storage(Some(&storage));
+        assert!(restored.encrypt.key.is_empty());
+        assert_eq!(restored.decrypt.key, app.decrypt.key);
+    }
+
+    #[test]
+    fn folder_drop_replaces_source_and_updates_only_suggested_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        let ordinary_file = temp.path().join("file.txt");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        std::fs::write(&ordinary_file, b"not a folder").unwrap();
+        let event = |path| egui::DroppedFile {
+            path: Some(path),
+            ..Default::default()
+        };
+        let area = egui::Rect::from_min_max(egui::pos2(100.0, 10.0), egui::pos2(200.0, 75.0));
+        let mut app = App::default();
+        assert!(app
+            .folder_dropped_at(area, egui::Pos2::ZERO, &[event(first.clone())])
+            .is_none());
+        assert!(app.drop_error.is_none());
+        assert!(app
+            .folder_dropped_at(area, area.center(), &[event(ordinary_file)])
+            .is_none());
+        assert!(app
+            .folder_dropped_at(
+                area,
+                area.center(),
+                &[event(first.clone()), event(second.clone())]
+            )
+            .is_none());
+        assert!(app.drop_error.is_some());
+
+        let ctx = egui::Context::default();
+        let drop_folder = |app: &mut App, path| {
+            let dropped = app.folder_dropped_at(area, area.center(), &[event(path)]);
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| app.show_form(ui, dropped.clone()));
+            });
+        };
+        drop_folder(&mut app, first.clone());
+        assert_eq!(Path::new(&app.encrypt.source), first);
+        assert_eq!(Path::new(&app.encrypt.output), first.with_extension("pak"));
+        assert!(app.drop_error.is_none());
+        drop_folder(&mut app, second.clone());
+        assert_eq!(Path::new(&app.encrypt.source), second);
+        assert_eq!(Path::new(&app.encrypt.output), second.with_extension("pak"));
+        app.encrypt.output = "chosen.pak".into();
+        drop_folder(&mut app, first.clone());
+        assert_eq!(Path::new(&app.encrypt.source), first);
+        assert_eq!(app.encrypt.output, "chosen.pak");
+    }
 
     #[test]
     fn closing_waits_for_success_and_keeps_failures_visible() {

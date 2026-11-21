@@ -28,14 +28,52 @@ cargo build --locked --workspace --release --target x86_64-pc-windows-msvc
 
 ### Linux
 
-CI 的 Linux 产物基于 Ubuntu 22.04 构建。在 Ubuntu 上从源码构建桌面版时，先安装以下依赖。
+CI 的 Linux 产物基于 Ubuntu 22.04 构建。在终端运行 `uname -m`，按照输出选择 GitHub Actions 中的产物。
+
+| `uname -m` 输出 | 下载的产物 |
+| --- | --- |
+| `x86_64` | `pakcipher-linux-x64` |
+| `aarch64` | `pakcipher-linux-arm64` |
+
+#### 下载并运行
+
+先解开 GitHub 下载的 ZIP，再解开里面的 `.tar.gz`。以下以 x64 的下载包为例，在 `.tar.gz` 所在目录运行。
+
+```sh
+mkdir -p pakcipher-linux
+tar -xzf pakcipher-linux-x64.tar.gz -C pakcipher-linux
+cd pakcipher-linux
+./pakcipher --version
+```
+
+使用桌面版时，在 X11 或 Wayland 图形会话中运行 `./pakcipher-gui`。窗口的 `Browse…` 按钮使用 XDG Desktop Portal。如果文件选择窗口打不开，检查当前桌面会话及其 Portal 后端。Ubuntu 可用 `sudo apt install libgl1 libegl1 libxkbcommon0 xdg-desktop-portal xdg-desktop-portal-gtk` 补装常用运行依赖。无桌面服务器可直接使用 CLI。
+
+#### 加密、恢复和验证
+
+按下文[准备密钥](#准备密钥)，将 `public.key` 和 `private.key` 放到工作目录。下面以新建的 `sample` 目录为例。
+
+```sh
+mkdir -p sample/nested sample/empty
+printf 'PakCipher sample\n' > sample/nested/notes.txt
+./pakcipher encrypt sample --key-file public.key --output sample.pak
+./pakcipher decrypt sample.pak --key-file private.key --output sample-restored --ask-passphrase
+diff -r sample sample-restored
+```
+
+私钥没有口令时，省略 `--ask-passphrase`。`sample.pak` 和 `sample-restored` 应使用尚未存在的路径。`diff -r` 无输出且退出码为 0，表示两份目录内容一致。
+
+使用 GUI 时，在 **Encrypt** 页选择 `sample`、`public.key` 和归档路径。点击 **Encrypt** 后切换到 **Decrypt** 页，选择生成的归档、`private.key` 和新的输出目录，再点击 **Restore**。两页的进度条在对应操作成功后都应显示 100%。若已经用 CLI 跑过一遍，请为 GUI 选择新的归档和输出目录。
+
+#### 从源码构建
+
+在 Ubuntu 上构建桌面版需要以下开发库。
 
 ```sh
 sudo apt-get install pkg-config libgl1-mesa-dev libxkbcommon-dev libwayland-dev libx11-dev
 cargo build --locked --release --workspace
 ```
 
-在 X11 或 Wayland 桌面会话中运行 `./pakcipher-gui`。GUI 的文件选择器使用桌面的 XDG Desktop Portal，需要处于活跃的图形会话，并安装桌面环境对应的 Portal 后端。CLI 可以在终端或无桌面环境中运行。
+运行 `target/release/pakcipher` 或 `target/release/pakcipher-gui`。只构建 CLI 时使用 `cargo build --locked --release -p pakcipher`。
 
 ### macOS
 

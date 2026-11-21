@@ -81,6 +81,26 @@ fn cli_roundtrip_and_archive_rejection() {
     .unwrap();
     fs::write(&private, key.to_armored_bytes(Default::default()).unwrap()).unwrap();
 
+    let conflicting = path("conflicting");
+    fs::create_dir(&conflicting).unwrap();
+    File::create_new(conflicting.join("report.txt")).unwrap();
+    match File::create_new(conflicting.join("REPORT.txt")) {
+        Ok(file) => {
+            drop(file);
+            let output = path("collision.pak");
+            let result = cli("encrypt", &conflicting, &public, &output);
+            assert!(!result.status.success());
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            assert!(
+                stderr.contains("report.txt") && stderr.contains("REPORT.txt"),
+                "{stderr}"
+            );
+            assert!(!output.exists());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => panic!("could not create a case collision: {error}"),
+    }
+
     let archive = path("archive.pak");
     assert_success(cli("encrypt", &source, &public, &archive));
     let restored = path("restored");

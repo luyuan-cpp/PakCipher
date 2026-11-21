@@ -67,12 +67,16 @@ struct App {
     max_volume_size: String,
     passphrase: Zeroizing<String>,
     job: Option<Job>,
+    close_after_job: bool,
     status: Option<(Page, bool, String)>,
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll();
+        if self.handle_close_request(ctx) {
+            return;
+        }
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("PakCipher");
             ui.horizontal(|ui| {
@@ -93,6 +97,9 @@ impl eframe::App for App {
             }
 
             if let Some(job) = &self.job {
+                if self.close_after_job {
+                    ui.label("Closing after the current operation finishes…");
+                }
                 if job.page == self.page {
                     let operation = match job.page {
                         Page::Encrypt => "Encrypting…",
@@ -133,6 +140,31 @@ impl eframe::App for App {
 }
 
 impl App {
+    fn handle_close_request(&mut self, ctx: &egui::Context) -> bool {
+        let close_requested = ctx.input(|input| input.viewport().close_requested());
+        if self.job.is_some() {
+            if close_requested {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.close_after_job = true;
+            }
+            return false;
+        }
+        if std::mem::take(&mut self.close_after_job) {
+            if let Some((page, success, _)) = &self.status {
+                if *success {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    return true;
+                }
+                self.page = *page;
+                if close_requested {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                }
+                return false;
+            }
+        }
+        close_requested
+    }
+
     fn show_keys(&mut self, ui: &mut egui::Ui) {
         let form = &mut self.keys;
         ui.label("Key label (included in the public key)");
@@ -433,4 +465,67 @@ fn main() -> eframe::Result {
         options,
         Box::new(|_| Ok(Box::new(App::default()))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn closing_waits_for_success_and_keeps_failures_visible() {
+        for outcome in [Ok(()), Err(pakcipher_core::Error::OutputInSource)] {
+            let success = outcome.is_ok();
+            let (send, result) = mpsc::channel();
+            let mut app = App {
+                job: Some(Job {
+                    page: Page::Encrypt,
+                    result,
+                    progress: Arc::default(),
+                }),
+                ..App::default()
+            };
+            let ctx = egui::Context::default();
+            let mut input = egui::RawInput::default();
+            let root = egui::ViewportId::ROOT;
+            input
+                .viewports
+                .get_mut(&root)
+                .unwrap()
+                .events
+                .push(egui::ViewportEvent::Close);
+            let output = ctx.run(input, |ctx| {
+                app.poll();
+                assert!(!app.handle_close_request(ctx));
+            });
+            assert!(output.viewport_output[&root]
+                .commands
+                .iter()
+                .any(|cmd| matches!(cmd, egui::ViewportCommand::CancelClose)));
+
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                assert!(!app.handle_close_request(ctx));
+            });
+            assert!(!output.viewport_output[&root]
+                .commands
+                .iter()
+                .any(|cmd| matches!(cmd, egui::ViewportCommand::Close)));
+
+            app.page = Page::About;
+            send.send(outcome).unwrap();
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                app.poll();
+                assert_eq!(app.handle_close_request(ctx), success);
+            });
+            assert_eq!(
+                output.viewport_output[&root]
+                    .commands
+                    .iter()
+                    .any(|cmd| matches!(cmd, egui::ViewportCommand::Close)),
+                success
+            );
+            assert!(app.job.is_none());
+            assert!(!app.close_after_job);
+            assert!(success || app.page == Page::Encrypt);
+        }
+    }
 }

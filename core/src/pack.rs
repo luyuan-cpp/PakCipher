@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs::{self, File},
     io::{BufWriter, Read, Write},
     path::{Path, PathBuf},
@@ -89,6 +90,7 @@ fn pack(
         };
         entries.push(Entry { source, name, size });
     }
+    check_portable_names(entries.iter().map(|entry| entry.name.as_str()))?;
     let count = u32::try_from(entries.len()).map_err(|_| Error::Format("too many entries"))?;
     let (seed, wrapped) = wrap_seed(key)?;
     let (cipher, mac) = derive_keys(&seed);
@@ -176,4 +178,38 @@ fn pack(
 
 fn chunk_count(size: u64) -> u64 {
     size.div_ceil(CHUNK as u64).max(1)
+}
+
+fn check_portable_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Result<()> {
+    let mut seen = HashMap::new();
+    for name in names {
+        let case_key = name.to_lowercase().to_uppercase();
+        if let Some(first) = seen.insert(case_key, name) {
+            return Err(Error::PathCaseCollision {
+                first: first.to_owned(),
+                second: name.to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_case_collisions_in_files_and_directories() {
+        for (first, second) in [
+            ("docs/report.txt", "docs/REPORT.txt"),
+            ("docs", "Docs"),
+            ("docs/Σ.txt", "docs/ς.txt"),
+        ] {
+            assert!(matches!(
+                check_portable_names([first, second]),
+                Err(Error::PathCaseCollision { first: a, second: b }) if a == first && b == second
+            ));
+        }
+        assert!(check_portable_names(["a", "a/report.txt", "b", "b/REPORT.txt"]).is_ok());
+    }
 }

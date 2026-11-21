@@ -18,6 +18,8 @@ pub enum Error {
     Volume(String),
     #[error("Unsupported path: {0}")]
     Path(String),
+    #[error("Paths collide on case-insensitive file systems: {first:?} and {second:?}")]
+    PathCaseCollision { first: String, second: String },
     #[error("Output must be outside the source folder.")]
     OutputInSource,
     #[error("The source file changed while being read: {0}")]

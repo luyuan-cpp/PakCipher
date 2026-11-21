@@ -119,3 +119,6 @@ fn verify_footer(mac: crate::crypto::ArchiveMac, expected: &[u8; 32]) -> Result<
     mac.verify_slice(expected)
         .map_err(|_| Error::Authentication)
 }
+
+#[cfg(test)]
+mod legacy_tests;

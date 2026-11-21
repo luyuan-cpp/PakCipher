@@ -2977,6 +2977,7 @@ dependencies = [
  "rand 0.8.8",
  "rsa",
  "sha2",
+ "tempfile",
  "thiserror 2.0.21",
  "walkdir",
  "zeroize",

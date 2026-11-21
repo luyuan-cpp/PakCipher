@@ -1,10 +1,17 @@
-use std::{fs::File, io::Read, path::Path};
+use std::{
+    fs::{self, File},
+    io::Read,
+    path::Path,
+};
 
 use aes_gcm::Aes256Gcm;
 use hkdf::Hkdf;
 use hmac::Hmac;
 use pgp::{
-    composed::{Deserializable, Message, MessageBuilder, SignedPublicKey, SignedSecretKey},
+    composed::{
+        Deserializable, EncryptionCaps, KeyType, Message, MessageBuilder, SecretKeyParamsBuilder,
+        SignedPublicKey, SignedSecretKey, SubkeyParamsBuilder,
+    },
     crypto::{public_key::PublicKeyAlgorithm, sym::SymmetricKeyAlgorithm},
     packet::{Signature, SignatureType},
     types::{KeyDetails, Password, PublicParams, Timestamp},
@@ -14,13 +21,75 @@ use rsa::traits::PublicKeyParts;
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
-use crate::{Error, Result};
+use crate::{
+    packet::{create_directory, create_file, output_path},
+    Error, Result,
+};
 
 pub struct PublicKey(SignedPublicKey);
 pub struct PrivateKey(SignedSecretKey);
 
 pub(crate) type ArchiveMac = Hmac<Sha256>;
 type Seed = Zeroizing<[u8; 32]>;
+
+pub fn generate_key_pair(output: &Path, user_id: &str, passphrase: &str) -> Result<()> {
+    let user_id = user_id.trim();
+    if user_id.is_empty() || user_id.len() > 256 || user_id.chars().any(char::is_control) {
+        return Err(Error::Key(
+            "enter a key label of 1 to 256 UTF-8 bytes".into(),
+        ));
+    }
+    if passphrase.trim().is_empty() {
+        return Err(Error::Key("a private key passphrase is required".into()));
+    }
+    let output = output_path(output)?;
+    create_directory(&output)?;
+    let private_path = output.join("private.key");
+    let public_path = output.join("public.key");
+    let mut private_created = false;
+    let mut public_created = false;
+
+    let result = (|| {
+        let subkey = SubkeyParamsBuilder::default()
+            .key_type(KeyType::Rsa(3072))
+            .can_encrypt(EncryptionCaps::All)
+            .passphrase(Some(passphrase.to_owned()))
+            .build()
+            .map_err(|error| Error::Key(error.to_string()))?;
+        let key = SecretKeyParamsBuilder::default()
+            .key_type(KeyType::Ed25519Legacy)
+            .can_certify(true)
+            .can_sign(true)
+            .primary_user_id(user_id.into())
+            .passphrase(Some(passphrase.to_owned()))
+            .subkeys(vec![subkey])
+            .build()
+            .map_err(|error| Error::Key(error.to_string()))?
+            .generate(OsRng)
+            .map_err(key_error)?;
+
+        let mut private = create_file(&private_path)?;
+        private_created = true;
+        key.to_armored_writer(&mut private, Default::default())
+            .map_err(key_error)?;
+        let mut public = create_file(&public_path)?;
+        public_created = true;
+        key.to_public_key()
+            .to_armored_writer(&mut public, Default::default())
+            .map_err(key_error)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        if private_created {
+            let _ = fs::remove_file(private_path);
+        }
+        if public_created {
+            let _ = fs::remove_file(public_path);
+        }
+        let _ = fs::remove_dir(&output);
+    }
+    result
+}
 
 pub fn load_public_key(path: &Path) -> Result<PublicKey> {
     let bytes = read_key(path)?;

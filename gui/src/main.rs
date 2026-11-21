@@ -16,16 +16,26 @@ use std::{
 
 use eframe::egui;
 use pakcipher_core::{
-    load_private_key, load_public_key, pack_folder, pack_folder_volumes, unpack_packet, VolumeSize,
+    generate_key_pair, load_private_key, load_public_key, pack_folder, pack_folder_volumes,
+    unpack_packet, VolumeSize,
 };
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum Page {
     #[default]
     Encrypt,
     Decrypt,
+    Keys,
     About,
+}
+
+#[derive(Default)]
+struct KeyForm {
+    label: String,
+    output: String,
+    passphrase: Zeroizing<String>,
+    confirmation: Zeroizing<String>,
 }
 
 #[derive(Default)]
@@ -52,6 +62,7 @@ struct App {
     page: Page,
     encrypt: Form,
     decrypt: Form,
+    keys: KeyForm,
     min_volume_size: String,
     max_volume_size: String,
     passphrase: Zeroizing<String>,
@@ -67,6 +78,7 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.page, Page::Encrypt, "Encrypt");
                 ui.selectable_value(&mut self.page, Page::Decrypt, "Decrypt");
+                ui.selectable_value(&mut self.page, Page::Keys, "Generate keys");
                 ui.selectable_value(&mut self.page, Page::About, "About");
             });
             ui.separator();
@@ -74,16 +86,19 @@ impl eframe::App for App {
                 ui.label("Offline folder encryption and restoration.");
                 ui.label("Encrypt with the recipient's OpenPGP RSA public key.");
                 ui.label("Archive names and sizes are visible. File contents are encrypted.");
+            } else if self.page == Page::Keys {
+                ui.add_enabled_ui(self.job.is_none(), |ui| self.show_keys(ui));
             } else {
                 ui.add_enabled_ui(self.job.is_none(), |ui| self.show_form(ui));
             }
 
             if let Some(job) = &self.job {
                 if job.page == self.page {
-                    let operation = if job.page == Page::Encrypt {
-                        "Encrypting…"
-                    } else {
-                        "Restoring…"
+                    let operation = match job.page {
+                        Page::Encrypt => "Encrypting…",
+                        Page::Decrypt => "Restoring…",
+                        Page::Keys => "Generating keys…",
+                        Page::About => "",
                     };
                     ui.label(operation);
                     let total = job.progress.total.load(Ordering::Relaxed);
@@ -118,6 +133,42 @@ impl eframe::App for App {
 }
 
 impl App {
+    fn show_keys(&mut self, ui: &mut egui::Ui) {
+        let form = &mut self.keys;
+        ui.label("Key label (included in the public key)");
+        ui.add(egui::TextEdit::singleline(&mut form.label).desired_width(f32::INFINITY));
+        path_field(
+            ui,
+            "New folder for public.key and private.key",
+            &mut form.output,
+            || {
+                rfd::FileDialog::new()
+                    .pick_folder()
+                    .map(|parent| parent.join("pakcipher-keys"))
+            },
+        );
+        password_field(ui, "Private key passphrase", &mut form.passphrase);
+        password_field(ui, "Confirm passphrase", &mut form.confirmation);
+        let matches = *form.passphrase == *form.confirmation;
+        if !form.confirmation.is_empty() && !matches {
+            ui.colored_label(ui.visuals().error_fg_color, "Passphrases do not match.");
+        }
+        let ready = !form.label.trim().is_empty()
+            && !form.output.is_empty()
+            && !form.passphrase.trim().is_empty()
+            && matches;
+        if ui
+            .add_enabled(ready, egui::Button::new("Generate key pair"))
+            .clicked()
+        {
+            let output = PathBuf::from(&form.output);
+            let label = form.label.clone();
+            let passphrase = std::mem::take(&mut form.passphrase);
+            form.confirmation.zeroize();
+            self.start_job(move |_| generate_key_pair(&output, &label, &passphrase));
+        }
+    }
+
     fn show_form(&mut self, ui: &mut egui::Ui) {
         let encrypting = self.page == Page::Encrypt;
         let form = if encrypting {
@@ -175,13 +226,11 @@ impl App {
                 );
             });
         } else {
-            ui.label("Private key passphrase (if protected)");
-            let mut field = egui::TextEdit::singleline(&mut *self.passphrase)
-                .password(true)
-                .desired_width(f32::INFINITY)
-                .show(ui);
-            field.state.clear_undoer();
-            field.state.store(ui.ctx(), field.response.id);
+            password_field(
+                ui,
+                "Private key passphrase (if protected)",
+                &mut self.passphrase,
+            );
         }
         let min = self.min_volume_size.trim();
         let max = self.max_volume_size.trim();
@@ -254,47 +303,57 @@ impl App {
             } else {
                 std::mem::take(&mut self.passphrase)
             };
-            self.status = None;
-            let (send, result) = mpsc::channel();
-            let progress = Arc::new(Progress::default());
-            let worker_progress = Arc::clone(&progress);
-            match thread::Builder::new()
-                .name("pakcipher".into())
-                .spawn(move || {
-                    let report = |done, total| {
-                        worker_progress.total.store(total, Ordering::Relaxed);
-                        worker_progress.done.store(done, Ordering::Relaxed);
-                    };
-                    let outcome = if encrypting {
-                        load_public_key(&key_file).and_then(|key| {
-                            if let Some(sizes) = sizes {
-                                pack_folder_volumes(&source, &key, &output, sizes, report)
-                            } else {
-                                pack_folder(&source, &key, &output, report)
-                            }
-                        })
-                    } else {
-                        load_private_key(&key_file).and_then(|key| {
-                            unpack_packet(&source, &key, &passphrase, &output, report)
-                        })
-                    };
-                    let _ = send.send(outcome);
-                }) {
-                Ok(_) => {
-                    self.job = Some(Job {
-                        page: self.page,
-                        result,
-                        progress,
+            self.start_job(move |worker_progress| {
+                let report = |done, total| {
+                    worker_progress.total.store(total, Ordering::Relaxed);
+                    worker_progress.done.store(done, Ordering::Relaxed);
+                };
+                if encrypting {
+                    load_public_key(&key_file).and_then(|key| {
+                        if let Some(sizes) = sizes {
+                            pack_folder_volumes(&source, &key, &output, sizes, report)
+                        } else {
+                            pack_folder(&source, &key, &output, report)
+                        }
                     })
+                } else {
+                    load_private_key(&key_file)
+                        .and_then(|key| unpack_packet(&source, &key, &passphrase, &output, report))
                 }
-                Err(error) => self.status = Some((self.page, false, error.to_string())),
+            });
+        }
+    }
+
+    fn start_job(
+        &mut self,
+        task: impl FnOnce(Arc<Progress>) -> pakcipher_core::Result<()> + Send + 'static,
+    ) {
+        self.status = None;
+        let (send, result) = mpsc::channel();
+        let progress = Arc::new(Progress::default());
+        let worker_progress = Arc::clone(&progress);
+        match thread::Builder::new()
+            .name("pakcipher".into())
+            .spawn(move || {
+                let _ = send.send(task(worker_progress));
+            }) {
+            Ok(_) => {
+                self.job = Some(Job {
+                    page: self.page,
+                    result,
+                    progress,
+                })
             }
+            Err(error) => self.status = Some((self.page, false, error.to_string())),
         }
     }
 
     fn poll(&mut self) {
         let Some(job) = &self.job else { return };
         let (success, message) = match job.result.try_recv() {
+            Ok(Ok(())) if job.page == Page::Keys => {
+                (true, "Saved public.key and private.key.".into())
+            }
             Ok(Ok(())) => (true, "Finished successfully.".into()),
             Ok(Err(error)) => (false, error.to_string()),
             Err(TryRecvError::Disconnected) => (false, "The operation ended unexpectedly.".into()),
@@ -303,6 +362,16 @@ impl App {
         self.status = Some((job.page, success, message));
         self.job = None;
     }
+}
+
+fn password_field(ui: &mut egui::Ui, label: &str, value: &mut String) {
+    ui.label(label);
+    let mut field = egui::TextEdit::singleline(value)
+        .password(true)
+        .desired_width(f32::INFINITY)
+        .show(ui);
+    field.state.clear_undoer();
+    field.state.store(ui.ctx(), field.response.id);
 }
 
 fn default_output(mut source: &Path, encrypting: bool, split: bool) -> Option<PathBuf> {

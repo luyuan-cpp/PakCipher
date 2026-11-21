@@ -88,7 +88,11 @@ macOS CI 产物使用 ad hoc 签名，未经 Apple 公证。下载时请选择�
 
 ## 准备密钥
 
-接收方可使用 GnuPG 生成包含 RSA 加密子密钥的证书，然后将公钥导出给发送方。将下面的邮箱替换为自己的邮箱。
+在 GUI 菜单中打开 **Generate keys**（生成密钥）。输入密钥标签，选择一个尚不存在的输出目录，再输入并确认私钥口令。点击 **Generate key pair** 后，应用会在本机生成包含 RSA 3072 位加密子密钥的 OpenPGP 密钥对，保存为 `public.key` 和 `private.key`。标签会出现在公钥中，请只填愿意公开的内容。
+
+在 **Encrypt** 页选用 `public.key`。在 **Decrypt** 页选用 `private.key` 并输入生成时设置的口令。请保管好私钥和口令。应用不会覆盖已有输出目录。
+
+也可使用 GnuPG 生成包含 RSA 加密子密钥的证书，然后将公钥导出给发送方。将下面的邮箱替换为自己的邮箱。
 
 ```sh
 gpg --quick-generate-key "PakCipher User <user@example.com>" rsa4096 cert,sign
